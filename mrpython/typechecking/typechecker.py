@@ -45,6 +45,9 @@ class TypingContext:
         self.local_env = None
         self.call_type_env = [] # stack of type environments when calling generic functions
         self.local_env = {}  # will have global variables
+        
+        self.encountered_variables = set()
+        self.variables_to_update = {}
 
     def add_type_error(self, error):
         self.type_errors.append(error)
@@ -62,6 +65,7 @@ class TypingContext:
     def register_parameters(self, parameters, param_types):
         self.param_env = {}
         for (param, param_type) in zip(parameters, param_types):
+            param_type.protect_all_subtypes()
             self.param_env[param] = param_type
 
     def register_return_type(self, return_type):
@@ -386,20 +390,7 @@ def fetch_assign_declaration_types(ctx, assign_target, strict=False):
 
     return declared_types
 
-def linearize_tuple_type(tuple_type):
-    if not isinstance(tuple_type, TupleType):
-        raise NotSupportedError("Can only linearize tuple types (please report)")
 
-    elem_types = []
-
-    for elem_type in tuple_type.elem_types:
-        if isinstance(elem_type, TupleType):
-            elem_types.extend(linearize_tuple_type(elem_type))
-        else:
-            elem_types.append(elem_type)
-
-    return elem_types
-    
 def type_check_Assign(assign, ctx, global_scope = False):
 
     # first let's see if the variables are dead
@@ -426,13 +417,17 @@ def type_check_Assign(assign, ctx, global_scope = False):
             else:
                 mono_assign = True
 
+
+    #very important, only consider mono assignation    
     if mono_assign:
         expr_type = assign.expr.type_infer(ctx)
         if expr_type is None:
             return False
-
-        # nothing else to do for actual assignment
+        var_name = assign.target.variables()[0].var_name
+        (previous_type,scope) = ctx.local_env[var_name]
+        previous_type.type_replacement(expr_type)
         return True
+        #return True
 
     # here we consider an initialization and not an actual assignment
     
@@ -447,52 +442,52 @@ def type_check_Assign(assign, ctx, global_scope = False):
     if expr_type is None:
         return False
     
-    # treat the simpler "mono-var" case first
-    if assign.target.arity() == 1:
-        var = assign.target.variables()[0]
-        if var.var_name not in declared_types:
-            # XXX: this is strict, need a dedicated error message ?
-            return False
-        
-        # compare inferred type wrt. declared type
-        if not declared_types[var.var_name].type_compare(ctx, assign.expr, expr_type):
-            return False
-
-        # register declared type in environment
-        ctx.local_env[var.var_name] = (declared_types[var.var_name], ctx.fetch_scope_mode())
-
-        return True
-        
-    # here we have a destructured initialization
-
-    
-    if not isinstance(expr_type, TupleType):
-        ctx.add_type_error(TypeExpectationError(ctx.function_def, assign.expr, expr_type,
-                                                tr("Expecting a tuple")))
+    if not linearize_tuple_type(assign.target, expr_type, declared_types, ctx, assign.target):
         return False
-
-    expr_var_types = linearize_tuple_type(expr_type)
-
-    if len(expr_var_types) != len(assign.target.variables()):
-        ctx.add_type_error(TupleDestructArityError(assign, expr_type, len(expr_var_types), len(assign.target.variables())))
-        return False
-
-    for (i, var) in zip(range(0, len(assign.target.variables())), assign.target.variables()):
-        if var.var_name == '_': # just skip this check
-            continue
-
-        if var.var_name in declared_types:
-            if not declared_types[var.var_name].type_compare(ctx, assign.target, expr_var_types[i], raise_error=False):
-                ctx.add_type_error(VariableTypeError(assign.target, var, declared_types[var.var_name], expr_var_types[i]))
-                return False
-        
-            ctx.local_env[var.var_name] = (declared_types[var.var_name], ctx.fetch_scope_mode())
-        else:
-            ctx.local_env[var.var_name] = (expr_var_types[i], ctx.fetch_scope_mode())    
-
     return True
 
 Assign.type_check = type_check_Assign
+
+
+
+def linearize_tuple_type(working_var, working_type, declared_types, ctx, expr):
+    if not isinstance(working_var, LHSTuple):
+        #check if working_var is an instance of LHSVar
+        if isinstance(working_var, LHSVar):
+            if working_var.var_name == '_': # just skip this check
+                return True
+            if declared_types is not None:
+                if working_var.var_name in declared_types:
+                    var_type = declared_types[working_var.var_name]
+                    if not var_type.type_compare(ctx, expr, working_type, raise_error=False):
+                        ctx.add_type_error(VariableTypeError(expr, working_var, declared_types[working_var.var_name], working_type))
+                    var_type = working_type.type_unification(var_type)
+                    ctx.local_env[working_var.var_name] = (var_type, ctx.fetch_scope_mode())
+                    
+                    ctx.local_env[working_var.var_name] = (working_type, ctx.fetch_scope_mode())
+                    return True
+                else:
+                    ctx.add_type_error(UndeclaredVariableError(expr, working_var))
+                    return False
+            #for EComp, maybe declared_types being None is not enough
+            else:
+                ctx.local_env[working_var.var_name] = (working_type, ctx.fetch_scope_mode())
+                return True
+        else:
+            raise NotSupportedError("Not assignating a variable, please report")
+            return False
+    elif not isinstance(working_type, TupleType):
+        ctx.add_type_error(TypeExpectationError(ctx.function_def, expr, working_type, tr("Expecting a tuple")))
+        return False
+    
+    if working_var.arity() != working_type.size():
+        ctx.add_type_error(TupleDestructArityError(expr, working_type, working_type.size(), working_var.arity()))
+        return False
+    for i in range(working_var.arity()):
+        if not linearize_tuple_type(working_var.elements[i], working_type.elem_types[i],  declared_types, ctx, expr):
+            return False
+
+    return True
 
 def type_check_For(for_node, ctx):
 
@@ -543,54 +538,11 @@ def type_check_For(for_node, ctx):
 
         # === do like in Assign ===
 
-        # treat the simpler "mono-var" case first
-        if for_node.target.arity() == 1:
-            var = for_node.target.variables()[0]
-            if var.var_name not in declared_types:
-                # XXX: this is strict, need a dedicated error message ?
-                ctx.pop_parent()
-                return False
-        
-            # compare inferred type wrt. declared type
-            if not declared_types[var.var_name].type_compare(ctx, for_node.iter, iter_type.elem_type if not isinstance(iter_type, StrType) else StrType()):
-                ctx.pop_parent()
-                return False
-
-            # register declared type in environment
-            ctx.local_env[var.var_name] = (declared_types[var.var_name], ctx.fetch_scope_mode())
-
-        else:
-            # here we have a destructured initialization
-            expr_type = iter_type.elem_type if not isinstance(iter_type, StrType) else StrType()
-            
-            if not isinstance(expr_type, TupleType):
-                ctx.add_type_error(TypeExpectationError(ctx.function_def, for_node.iter, expr_type,
-                                                        tr("Expecting an iterator of tuples")))
-                ctx.pop_parent()
-                return False
-
-            expr_var_types = linearize_tuple_type(expr_type)
-
-            if len(expr_var_types) != len(for_node.target.variables()):
-                ctx.add_type_error(TupleDestructArityError(for_node.target, expr_type, len(expr_var_types), len(for_node.target.variables())))
-                ctx.pop_parent()
-                return False
-
-            for (i, var) in zip(range(0, len(for_node.target.variables())), for_node.target.variables()):
-                if var.var_name == '_': # just skip this check
-                    continue
-
-                if var.var_name in declared_types:
-                    if not declared_types[var.var_name].type_compare(ctx, var, expr_var_types[i], raise_error=False):
-                        ctx.add_type_error(VariableTypeError(for_node.target, var, declared_types[var_name], expr_var_types[i]))
-                        ctx.pop_parent()
-                        return False
-        
-                    ctx.local_env[var.var_name] = (declared_types[var.var_name], ctx.fetch_scope_mode())
-                else:
-                    ctx.local_env[var.var_name] = (expr_var_types[i], ctx.fetch_scope_mode())    
-
-        # and now type check the body in the constructed local env
+        #basically does the same as assign
+        expr_type = iter_type.elem_type if not isinstance(iter_type, StrType) else StrType()
+        if not linearize_tuple_type(for_node.target, expr_type, declared_types, ctx, for_node.target):
+            ctx.pop_parent()
+            return False
 
         for instr in for_node.body:
             if not instr.type_check(ctx):
@@ -887,12 +839,16 @@ def type_infer_EAdd(expr, ctx):
                                                    tr("Expecting a list")))
             return None
 
-        if left_type.elem_type != right_type.elem_type:
+        if not left_type.elem_type.type_compare(ctx, expr, right_type.elem_type):
             ctx.add_type_error(TypeComparisonError(ctx.function_def, left_type.elem_type, expr.right, right_type.elem_type,
                                                    tr("Expecting a list with elements of type: {}").format(left_type.elem_type)))
             return None
-
-        return left_type
+        
+        if (right_type.elem_type is None) or (left_type.elem_type is None):
+            raise NotImplementedError("Error in method type_infer_EAdd of typechecker, please report")
+            
+        #have to add UnionType
+        return ListType(elem_type = right_type.elem_type.type_unification(left_type.elem_type), types_dep = [left_type.elem_type, right_type.elem_type])
 
     else:
         ctx.add_type_error(TypeComparisonError(ctx.function_def, ListType(), expr.left, left_type,
@@ -1131,6 +1087,7 @@ def type_infer_EVar(var, ctx):
         return None
 
     # check if the var is a parameter
+    ctx.encountered_variables.add(var.name)
     if ctx.param_env and var.name in ctx.param_env:
         return ctx.param_env[var.name]
     # or else lookup in the local environment
@@ -1193,6 +1150,50 @@ def type_infer_ENone(node, ctx):
 
 ENone.type_infer = type_infer_ENone
 
+def get_types_dep_Indexing(indexing, ctx):
+    
+    lst_types = indexing.subject.get_types_dep(ctx)
+    
+    
+    if lst_types is None:
+        return None
+    
+    res = []
+    for lst_type in lst_types:
+        if not (isinstance(lst_type, ListType) or isinstance(lst_type, Anything)):
+            print(lst_type)
+            raise NotImplementedError("not done yet for dict and sequential")
+        for t in lst_type.types_dep:
+            tmp = t.get_types_dep(ctx)
+            if tmp is None:
+                return None
+        res += lst_type.types_dep
+    return res
+    
+Indexing.get_types_dep = get_types_dep_Indexing
+
+def get_types_dep_var(var, ctx):
+    (type_var,_) = ctx.local_env[var.name]
+    return type_var.get_types_dep(ctx)
+
+EVar.get_types_dep =get_types_dep_var
+
+def get_types_dep_Expr(e, ctx):
+    return [e.type_infer(ctx)]
+Expr.get_types_dep = get_types_dep_Expr
+
+def get_types_dep_ListType(lst, ctx):
+    if lst.is_protected():
+        return None
+    return [lst]
+ListType.get_types_dep = get_types_dep_ListType
+
+def get_types_dep_SetType(s, ctx):
+    if s.is_protected():
+        return None
+    return []
+SetType.get_types_dep = get_types_dep_SetType
+    
 def type_infer_ECall(call, ctx):
     # step 1 : fetch the signature of the called function
     if call.full_fun_name in ctx.global_env:
@@ -1253,8 +1254,24 @@ def type_infer_ECall(call, ctx):
                 ctx.call_type_env.pop()
                 return None
         num_arg += 1
-
-    # step 4 : return the return type
+        
+    #step 4: check for side effect. It should probably be integrated to step 3 for more efficiency
+    if call.fun_name in {"append"}:
+        types_dep = call.receiver.get_types_dep(ctx)
+        if types_dep is None:
+            ctx.add_type_error(SideEffectWarning(ctx.function_def,call,call.fun_name, call.receiver))
+            return None
+        append_type = call.arguments[0].type_infer(ctx)
+        for t in types_dep:
+            t.add_type_dep(append_type)
+        
+    elif call.fun_name in {"add", "remove"}:
+        types_dep = call.receiver.get_types_dep(ctx)
+        if types_dep is None:
+            ctx.add_type_error(SideEffectWarning(ctx.function_def,call,call.fun_name, call.receiver))
+            return None
+        
+    # step 5 : return the return type
     if ctx.call_type_env[-1]:
         nret_type = signature.ret_type.subst(ctx.call_type_env[-1])
     else:
@@ -1395,15 +1412,17 @@ def type_infer_EList(lst, ctx):
     lst_type = None
     if not lst.elements:
         return ListType()
-
+    
+    elems_type = []
     for element in lst.elements:
         element_type = element.type_infer(ctx)
+        elems_type.append(element_type)
         if element_type is None:
             return None
         #print("----\nelement type={}".format(element_type))
         #print("lst type={}\n----".format(lst_type))
-        if lst_type is None:
-            lst_type = element_type
+        if lst_type is None or isinstance(lst_type, Anything):
+            lst_type= element_type
         else:
             if (isinstance(lst_type, (IntType, FloatType, NumberType)) 
                 and isinstance(element_type, (IntType, FloatType, NumberType))):
@@ -1412,8 +1431,10 @@ def type_infer_EList(lst, ctx):
                 if not lst_type.type_compare(ctx, element, element_type, raise_error=False):
                     ctx.add_type_error(HeterogeneousElementError('list', lst, lst_type, element_type, element))
                     return None
+                #lst_type = lst_type.type_unification(lst_type_prv)
+        #lst_type_prv = lst_type
 
-    return ListType(lst_type)
+    return ListType(lst_type, types_dep = elems_type)
 
 EList.type_infer = type_infer_EList
 
@@ -1464,6 +1485,7 @@ def type_infer_Slicing(slicing, ctx):
 
     elif isinstance(subject_type, StrType):
         result_type = StrType() # XXX: typical python twist !
+        return StrType()
         
     else:
         ctx.add_type_error(SlicingError(slicing, subject_type))
@@ -1480,7 +1502,7 @@ def type_infer_Slicing(slicing, ctx):
     if slicing.step and not type_expect(ctx, slicing.step, IntType(), raise_error=True):
         return None
 
-    return result_type
+    return ListType(elem_type = result_type.elem_type, types_dep = result_type.types_dep)
 
 Slicing.type_infer = type_infer_Slicing
 
@@ -1505,53 +1527,9 @@ def type_infer_EComp(ecomp, ctx):
             else:
                 iter_elem_type = iter_type.elem_type
             
-            if generator.target.arity() == 1:
-                var = generator.target.variables()[0]
-                if var.var_name in ctx.dead_variables:
-                    ctx.add_type_error(DeadVariableDefineError(var.var_name, var))
+            if not linearize_tuple_type(generator.target, iter_elem_type, None, ctx, generator.target):
                     ctx.pop_parent()
                     return None
-                elif var.var_name in ctx.local_env:
-                    ctx.add_type_error(IterVariableInEnvError(var.var_name, var))
-                    ctx.pop_parent()
-                    return None
-                # check that the variable is not a parameter
-                elif ctx.param_env and var.var_name in ctx.param_env:
-                    ctx.add_type_error(ParameterInCompError(var.var_name, var))
-                    return None
-                elif var.var_name != "_":
-                    ctx.local_env[var.var_name] = (iter_elem_type, ctx.fetch_scope_mode())
-            else: # tuple destruct
-                if not isinstance(iter_elem_type, TupleType):
-                    ctx.add_type_error(TypeExpectationError(ctx.function_def, generator.iter, iter_elem_type,
-                                                            tr("Expecting an iterator of tuples")))
-                    ctx.pop_parent()
-                    return None
-
-                expr_var_types = linearize_tuple_type(iter_elem_type)
-
-                if len(expr_var_types) != len(generator.target.variables()):
-                    ctx.add_type_error(TupleDestructArityError(generator.target, iter_elem_type, len(expr_var_types), len(generator.target.variables())))
-                    ctx.pop_parent()
-                    return None
-
-                for (i, var) in zip(range(0, len(generator.target.variables())), generator.target.variables()):
-                    if var.var_name in ctx.dead_variables:
-                        ctx.add_type_error(DeadVariableDefineError(var.var_name, var))
-                        ctx.pop_parent()
-                        return None
-                    # check that the variable is not a parameter
-                    elif ctx.param_env and var.var_name in ctx.param_env:
-                        ctx.add_type_error(ParameterInCompError(var.var_name, var))
-                        return None 
-                    elif var.var_name in ctx.local_env:
-                        ctx.add_type_error(IterVariableInEnvError(var.var_name, var))
-                        ctx.pop_parent()
-                        return None
-                    elif var.var_name != "_":
-                        ctx.local_env[var.var_name] = (expr_var_types[i], ctx.fetch_scope_mode())
-
-            # now the lexical env is built for this generator conditions
 
             for condition in generator.conditions:
                 if not type_expect(ctx, condition, BoolType()):
@@ -1716,10 +1694,14 @@ def check_option_type(cause_fn, expected_precise_type, ctx, expr, expr_option_ty
         return False
 
 def type_compare_NumberType(expected_type, ctx, expr, expr_type, raise_error=True):
-    # XXX: boilerplate ... could use a decorator of some sort ?
+    # XXX: boilerplate ... could use a decorator of some sort ? definitely should use a decorator with Anything added
+    
     if isinstance(expr_type, OptionType):
         return check_option_type(type_compare_NumberType, expected_type, ctx, expr, expr_type, raise_error)
 
+    if isinstance(expr_type, Anything):
+        return True
+    
     if isinstance(expr_type, NumberType) \
        or isinstance(expr_type, IntType) \
        or isinstance(expr_type, FloatType): 
@@ -1735,6 +1717,9 @@ NumberType.type_compare = type_compare_NumberType
 def type_compare_IntType(expected_type, ctx, expr, expr_type, raise_error=True):
     if isinstance(expr_type, OptionType):
         return check_option_type(type_compare_IntType, expected_type, ctx, expr, expr_type, raise_error)
+    
+    if isinstance(expr_type, Anything):
+        return True
 
     if isinstance(expr_type, IntType):
         return True
@@ -1758,6 +1743,9 @@ def type_compare_FloatType(expected_type, ctx, expr, expr_type, raise_error=True
 
     if isinstance(expr_type, (FloatType, IntType, NumberType)):
         return True
+    
+    if isinstance(expr_type, Anything):
+        return True
 
     if raise_error:
         ctx.add_type_error(TypeComparisonError(ctx.function_def, expected_type, expr, expr_type, tr("Expecting a float")))
@@ -1769,7 +1757,10 @@ FloatType.type_compare = type_compare_FloatType
 def type_compare_BoolType(expected_type, ctx, expr, expr_type, raise_error=True):
     if isinstance(expr_type, OptionType):
         return check_option_type(type_compare_BoolType, expected_type, ctx, expr, expr_type, raise_error)
-
+    
+    if isinstance(expr_type, Anything):
+        return True
+    
     if isinstance(expr_type, BoolType):
         return True
 
@@ -1783,7 +1774,8 @@ BoolType.type_compare = type_compare_BoolType
 def type_compare_FileType(expected_type, ctx, expr, expr_type, raise_error=True):
     if isinstance(expr_type, FileType):
         return True
-
+    if isinstance(expr_type, Anything):
+        return True
     if raise_error:
         ctx.add_type_error(TypeComparisonError(ctx.function_def, expected_type, expr, expr_type, tr("Expecting a File")))
 
@@ -1794,10 +1786,10 @@ FileType.type_compare = type_compare_FileType
 def type_compare_ImageType(expected_type, ctx, expr, expr_type, raise_error=True):
     if isinstance(expr_type, OptionType):
         return check_option_type(type_compare_ImageType, expected_type, ctx, expr, expr_type, raise_error)
-
+    if isinstance(expr_type, Anything):
+        return True
     if isinstance(expr_type, ImageType):
         return True
-
     if raise_error:
         ctx.add_type_error(TypeComparisonError(ctx.function_def, expected_type, expr, expr_type, tr("Expecting an image (type Image)")))
 
@@ -1809,8 +1801,13 @@ def type_compare_StrType(expected_type, ctx, expr, expr_type, raise_error=True):
     if isinstance(expr_type, OptionType):
         return check_option_type(type_compare_StrType, expected_type, ctx, expr, expr_type, raise_error)
 
+    if isinstance(expr_type, Anything):
+        return True
+    
     if isinstance(expr_type, StrType):
         return True
+    
+    
 
     if raise_error:
         ctx.add_type_error(TypeComparisonError(ctx.function_def, expected_type, expr, expr_type, tr("Expecting a string (type str)")))
@@ -1820,28 +1817,31 @@ def type_compare_StrType(expected_type, ctx, expr, expr_type, raise_error=True):
 StrType.type_compare = type_compare_StrType
 
 def type_compare_ListType(expected_type, ctx, expr, expr_type, raise_error=True):
+    
     if isinstance(expr_type, OptionType):
         return check_option_type(type_compare_ListType, expected_type, ctx, expr, expr_type, raise_error)
-
+    
+    if isinstance(expr_type, Anything):
+        return True
+    
     if not isinstance(expr_type, ListType):
         if raise_error:
             ctx.add_type_error(TypeComparisonError(ctx.function_def, expected_type, expr, expr_type, tr("Expecting a list")))
         return False
 
-    if expr_type.is_emptylist():
-        return True
-
-    if expected_type.is_emptylist():
-        return True
-
+    
     return expected_type.elem_type.type_compare(ctx, expr, expr_type.elem_type, raise_error)
+    
 
 ListType.type_compare = type_compare_ListType
 
 def type_compare_SetType(expected_type, ctx, expr, expr_type, raise_error=True):
     if isinstance(expr_type, OptionType):
         return check_option_type(type_compare_SetType, expected_type, ctx, expr, expr_type, raise_error)
-
+    
+    if isinstance(expr_type, Anything):
+        return True
+    
     if not isinstance(expr_type, SetType):
         if raise_error:
             ctx.add_type_error(TypeComparisonError(ctx.function_def, expected_type, expr, expr_type, tr("Expecting a set")))
@@ -1861,6 +1861,9 @@ def type_compare_IterableType(expected_type, ctx, expr, expr_type, raise_error=T
     if isinstance(expr_type, OptionType):
         return check_option_type(type_compare_IterableType, expected_type, ctx, expr, expr_type, raise_error)
 
+    if isinstance(expr_type, Anything):
+        return True
+    
     if isinstance(expr_type, ListType) and expr_type.is_emptylist():
         return True
 
@@ -1888,7 +1891,9 @@ IterableType.type_compare = type_compare_IterableType
 def type_compare_SequenceType(expected_type, ctx, expr, expr_type, raise_error=True):
     if isinstance(expr_type, OptionType):
         return check_option_type(type_compare_SequenceType, expected_type, ctx, expr, expr_type, raise_error)
-
+    if isinstance(expr_type, Anything):
+        return True
+    
     if isinstance(expr_type, SequenceType) \
        or isinstance(expr_type, ListType) \
        or isinstance(expr_type, SetType):
@@ -1909,7 +1914,8 @@ def type_compare_TypeVariable(expected_type, ctx, expr, expr_type, raise_error=T
 
     if isinstance(expr_type, OptionType):
         return check_option_type(type_compare_TypeVariable, expected_type, ctx, expr, expr_type, raise_error)
-    
+    if isinstance(expr_type, Anything):
+        return True
     # some corner case handled here ...
     if expected_type == expr_type:
         return True
@@ -1949,7 +1955,9 @@ TypeVariable.type_compare = type_compare_TypeVariable
 def type_compare_NoneTypeType(expected_type, ctx, expr, expr_type, raise_error=True):
     if isinstance(expr_type, OptionType):
         return check_option_type(type_compare_NoneTypeType, expected_type, ctx, expr, expr_type, raise_error)
-
+    if isinstance(expr_type, Anything):
+        return True
+    
     if not isinstance(expr_type, NoneTypeType):
         if raise_error:
             ctx.add_type_error(TypeComparisonError(ctx.function_def, expected_type, expr, expr_type, tr("Expecting value None")))
@@ -1971,7 +1979,9 @@ def type_compare_OptionType(expected_type, ctx, expr, expr_type, raise_error=Tru
             return True
         
     # expression type is not an option type
-
+    if isinstance(expr_type, Anything):
+        return True
+    
     if isinstance(expr_type, NoneTypeType):
         return True
         
@@ -1987,7 +1997,9 @@ OptionType.type_compare = type_compare_OptionType
 def type_compare_TupleType(expected_type, ctx, expr, expr_type, raise_error=True):
     if isinstance(expr_type, OptionType):
         return check_option_type(type_compare_TupleType, expected_type, ctx, expr, expr_type, raise_error)
-
+    if isinstance(expr_type, Anything):
+        return True
+    
     if not isinstance(expr_type, TupleType):
         ctx.add_type_error(TypeComparisonError(ctx.function_def, expected_type, expr, expr_type, tr("Expecting a tuple")))
         return False
@@ -2008,7 +2020,9 @@ TupleType.type_compare = type_compare_TupleType
 def type_compare_DictType(expected_type, ctx, expr, expr_type, raise_error=True):
     if isinstance(expr_type, OptionType):
         return check_option_type(type_compare_DictType, expected_type, ctx, expr, expr_type, raise_error)
-
+    if isinstance(expr_type, Anything):
+        return True
+    
     if not isinstance(expr_type, DictType):
         ctx.add_type_error(TypeComparisonError(ctx.function_def, expected_type, expr, expr_type, tr("Expecting a dictionary")))
         return False
@@ -2332,6 +2346,23 @@ class UnknownVariableError(TypeError):
     def report(self, report):
         report.add_convention_error('error', tr("Variable problem"), self.var.ast.lineno, self.var.ast.col_offset
                                     , tr("there is such variable of name '{}'").format(self.var.name))
+        
+class UndeclaredVariableError(TypeError):
+    def __init__(self, in_function, var):
+        self.in_function = in_function
+        self.var = var
+
+    def is_fatal(self):
+        return True
+
+    def fail_string(self):
+        return "UndeclaredVariableError[{}]@{}:{}".format(self.var.var_name
+                                                       , self.var.ast.lineno
+                                                       , self.var.ast.col_offset)
+
+    def report(self, report):
+        report.add_convention_error('error', tr("Missing variable declaration"), self.var.ast.lineno, self.var.ast.col_offset
+                                    , tr("Variable(s) not declared: {}").format(self.var.var_name))
 
 class TypeComparisonError(TypeError):
     def __init__(self, in_function, expected_type, expr, expr_type, explain):
@@ -2925,8 +2956,26 @@ class ContainerAssignEmptyError(TypeError):
         report.add_convention_error('error', tr("Bad assignment"), self.cassign.container_expr.ast.lineno, self.cassign.container_expr.ast.col_offset
                                     , tr("Assignment in an empty dictionary"))
 
-        
-if __name__ == '__main__':
 
-    ctx = typecheck_from_file("../../test/progs/01_aire_KO_14.py")
-    print(repr(ctx))
+class SideEffectWarning(TypeError):
+    def __init__(self, in_function, expr, fun_name, receiver):
+        self.in_function = in_function
+        self.receiver = receiver
+        self.fun_name = fun_name
+        self.expr = expr
+
+    def is_fatal(self):
+        return False
+
+    def fail_string(self):
+        return "SideEffectWarning[{}]@{}:{}".format(self.fun_name, self.expr.ast.lineno, self.expr.ast.col_offset)
+
+    def report(self, report):
+        report.add_convention_error('warning', tr("Call to {} may cause side effect").format(self.fun_name), self.expr.ast.lineno, self.expr.ast.col_offset
+                                    , tr("There is a risk of side effect as {} may reference a parameter").format(self.receiver))
+
+
+if __name__ == '__main__':
+    ctx = typecheck_from_file("../../test/progs/31_side_effect_set_KO_00.py")
+    #ctx = typecheck_from_file("../../test/progs/26_side_effect_concat_KO_01.py")
+    #print(repr(ctx))
