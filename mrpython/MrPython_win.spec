@@ -4,7 +4,8 @@ block_cipher = None
 
 
 DATA_FILES = [("./config-*.def", ".")
-              ,("./icons/*.gif", "icons")]
+              ,("./icons/*.gif", "icons")
+              ,("./icons/*.png", "icons")]
 
 a = Analysis(['Application.py'],
              pathex=['C:\\Users\\Fredokun\\Projets\\MrPython\\mrpython'],
@@ -37,4 +38,4 @@ coll = COLLECT(exe,
                strip=False,
                upx=True,
                upx_exclude=[],
-               name='MrPython')
+               name='MrPython_traced')
