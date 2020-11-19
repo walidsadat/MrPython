@@ -1,4 +1,3 @@
-
 """The abstract syntax tree of programs."""
 
 import ast
@@ -124,7 +123,7 @@ def check_typing_imports(node):
         if alias.name not in ALLOWED_TYPING_IMPORTS:
             return False
     return True
-        
+
 def check_typevar_assign(node):
     # TODO : more precise error checking
     if len(node.targets) != 1:
@@ -139,7 +138,7 @@ def check_typevar_assign(node):
         return False
 
     return True
-        
+
 
 class UnsupportedNode:
     def __init__(self, node):
@@ -264,7 +263,10 @@ class DeclareVar:
 class ContainerAssign:
     def __init__(self, target, expr):
         self.container_expr = parse_expression(target.value)
-        self.container_index = parse_expression(target.slice.value)
+        if hasattr(target.slice, "value"):
+            self.container_index = parse_expression(target.slice.value)
+        elif hasattr(target.slice, "id"):
+            self.container_index = parse_expression(target.slice.id)
         self.assign_expr = parse_expression(expr)
 
 
@@ -795,12 +797,23 @@ class EList(Expr):
 
 class Indexing(Expr):
     def __init__(self, node):
+        #print(astpp.dump(node))
         self.ast = node
         self.subject = parse_expression(node.value)
-        self.index = parse_expression(node.slice.value)
+        if isinstance(node, ast.Subscript) and hasattr(node, "value") \
+        and hasattr(node.value, "id") and node.value.id in {"Tuple"}:
+            # do nothing, it is probably a Tuple type annotation
+            pass
+        elif hasattr(node.slice, "value"):
+            self.index = parse_expression(node.slice.value)
+        elif hasattr(node.slice, "id"):
+            self.index = parse_expression(node.slice.id)
+        else:
+            raise ValueError("Indexing error (please report)")
 
 class Slicing(Expr):
     def __init__(self, node):
+        #print(astpp.dump(node))
         self.ast = node
         self.subject = parse_expression(node.value)
         self.lower = None
@@ -814,7 +827,8 @@ class Slicing(Expr):
             self.step = parse_expression(node.slice.step)
 
 def parse_subscript(node):
-    if isinstance(node.slice, ast.Index):
+    if isinstance(node.slice, (ast.Index, ast.Constant, ast.Name)) or \
+    (isinstance(node, ast.Subscript) and isinstance(node.slice, (ast.Constant, ast.Tuple))):
         return Indexing(node)
     else:
         return Slicing(node)
