@@ -571,6 +571,11 @@ def fetch_assign_declaration_types(ctx, assign_target, strict=False):
     return declared_types
 
 def check_linearized_tuple_type(working_var, working_type, declared_types, ctx, expr, strict=False):
+    # take care of Optional
+    if isinstance(working_type, OptionType):
+        # add a warning
+        ctx.add_type_error(OptionCoercionWarning(expr, working_type, working_type.elem_type))
+        working_type = working_type.elem_type
 
     if not isinstance(working_var, LHSTuple):
         #check if working_var is an instance of LHSVar
@@ -2740,7 +2745,7 @@ class OptionCoercionWarning(TypeError):
 
     def report(self, report):
         report.add_convention_error('warning', tr("Imprecise typing"), self.expr.ast.lineno, self.expr.ast.col_offset
-                                    , tr("Expecting precise type '{}' but found less precise type: {}").format(self.expected_precise_type, self.expr_option_type))
+                                    , tr("Expecting type '{}' but found less precise type '{}' (the value could be None)").format(self.expected_precise_type, self.expr_option_type))
 
 
 class UnsupportedNumericTypeError(TypeError):
