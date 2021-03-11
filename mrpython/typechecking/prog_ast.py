@@ -52,6 +52,9 @@ class Program:
         # other top level definitions
         self.other_top_defs = []
 
+        # function multi-declared 
+        self.multi_declared_functions = dict()
+
         # metadata
         self.filename = None
         self.source = None
@@ -85,7 +88,6 @@ class Program:
         if not isinstance(modast, ast.Module):
             raise ValueError("Cannot build program from AST: not a module (please report)")
         self.ast = modast
-
         for node in modast.body:
             #print(str(dir(node)))
             if isinstance(node, ast.Import):
@@ -97,7 +99,10 @@ class Program:
             elif isinstance(node, ast.FunctionDef):
                 fun_ast = FunctionDef(node)
                 if fun_ast.python101ready:
-                    self.functions[fun_ast.name] = fun_ast
+                    if fun_ast.name in self.functions:
+                        self.multi_declared_functions[fun_ast.name] = node.lineno
+                    else:
+                        self.functions[fun_ast.name] = fun_ast
                 else:
                     self.other_top_defs.append(UnsupportedNode(node))
             elif isinstance(node, ast.Assert):
